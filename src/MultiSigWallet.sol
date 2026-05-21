@@ -228,7 +228,7 @@ contract MultiSigWallet is ReentrancyGuard {
     }
 
     // ============================================================
-    // GETTER FUNCTIONS
+    // GETTER FUNCTION
     // ============================================================
 
     function getTransactionCount() external view returns (uint256) {
