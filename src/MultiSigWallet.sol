@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
-contract MultiSigWallet is ReentrancyGuard {
+contract MultiSigWallet is ReentrancyGuard, EIP712 {
 
     event Deposit(address indexed sender, uint256 amount, uint256 balance);
     event TransactionProposed(uint256 indexed txId, address indexed proposer, address indexed to, uint256 value, bytes data);
@@ -14,6 +16,8 @@ contract MultiSigWallet is ReentrancyGuard {
     event OwnerAdded(address indexed newOwner);
     event OwnerRemoved(address indexed removedOwner);
     event RequirementChanged(uint256 oldRequired, uint256 newRequired);
+
+    bytes32 private constant APPROVAL_TYPEHASH = keccak256("Approval(uint256 txId)");
 
     struct Transaction {
         address to;
@@ -67,7 +71,7 @@ contract MultiSigWallet is ReentrancyGuard {
         address[] memory _owners,
         uint256 _required,
         uint256 _txExpiry
-    ) payable {
+    ) payable EIP712("MultiSigWallet", "1") {
         require(_owners.length >= 2, "MultiSig: Need at least 2 owners");
         require(_required >= 1 && _required <= _owners.length, "MultiSig: Invalid required count");
         require(_txExpiry >= 1 hours, "MultiSig: Expiry too short");
@@ -92,12 +96,12 @@ contract MultiSigWallet is ReentrancyGuard {
     // CORE FUNCTIONS
     // ============================================================
 
-    // ✅ CHANGED: calldata → memory
+    // Anyone can propose a transaction — no owner restriction
     function proposeTransaction(
         address _to,
         uint256 _value,
         bytes memory _data
-    ) public onlyOwner returns (uint256 txId) {
+    ) public returns (uint256 txId) {
         require(_to != address(0), "MultiSig: Invalid recipient");
         txId = transactions.length;
         transactions.push(Transaction({
@@ -111,14 +115,34 @@ contract MultiSigWallet is ReentrancyGuard {
             proposer: msg.sender
         }));
         emit TransactionProposed(txId, msg.sender, _to, _value, _data);
-        _approve(txId);
+        // Auto-approve only if the proposer happens to be an owner
+        if (isOwner[msg.sender]) {
+            _approve(txId);
+        }
     }
 
+    // Direct approve: owner calls this themselves and pays their own gas
     function approve(uint256 _txId)
         external onlyOwner txExists(_txId) notExecuted(_txId) notCancelled(_txId) notExpired(_txId)
     {
         require(!approved[_txId][msg.sender], "MultiSig: Already approved");
         _approve(_txId);
+    }
+
+    // Meta-approval: owner signs off-chain, anyone can submit — submitter pays gas, not the owner
+    function approveWithSignature(uint256 _txId, bytes memory _signature)
+        external txExists(_txId) notExecuted(_txId) notCancelled(_txId) notExpired(_txId)
+    {
+        bytes32 structHash = keccak256(abi.encode(APPROVAL_TYPEHASH, _txId));
+        bytes32 digest = _hashTypedDataV4(structHash);
+        address signer = ECDSA.recover(digest, _signature);
+
+        require(isOwner[signer], "MultiSig: Signer is not an owner");
+        require(!approved[_txId][signer], "MultiSig: Already approved by this owner");
+
+        approved[_txId][signer] = true;
+        transactions[_txId].approvals += 1;
+        emit TransactionApproved(_txId, signer);
     }
 
     function revokeApproval(uint256 _txId)
@@ -161,36 +185,39 @@ contract MultiSigWallet is ReentrancyGuard {
     // SIMPLE WRAPPER FUNCTIONS
     // ============================================================
 
+    // Anyone can propose an ETH transfer
     function proposeEthTransfer(
         address _to,
         uint256 _value
-    ) external onlyOwner returns (uint256 txId) {
+    ) external returns (uint256 txId) {
         require(_to != address(0), "MultiSig: Invalid recipient");
         require(_value > 0, "MultiSig: Amount must be > 0");
         return proposeTransaction(_to, _value, "");
     }
 
+    // Anyone can propose a token transfer
     function proposeTokenTransfer(
         address _token,
         address _to,
         uint256 _amount
-    ) external onlyOwner returns (uint256 txId) {
+    ) external returns (uint256 txId) {
         require(_token != address(0), "MultiSig: Invalid token address");
         require(_to != address(0), "MultiSig: Invalid recipient");
         require(_amount > 0, "MultiSig: Amount must be > 0");
-        
+
         bytes memory data = abi.encodeWithSignature("transfer(address,uint256)", _to, _amount);
         return proposeTransaction(_token, 0, data);
     }
 
+    // Anyone can propose a token approve
     function proposeTokenApprove(
         address _token,
         address _spender,
         uint256 _amount
-    ) external onlyOwner returns (uint256 txId) {
+    ) external returns (uint256 txId) {
         require(_token != address(0), "MultiSig: Invalid token address");
         require(_spender != address(0), "MultiSig: Invalid spender");
-        
+
         bytes memory data = abi.encodeWithSignature("approve(address,uint256)", _spender, _amount);
         return proposeTransaction(_token, 0, data);
     }
@@ -228,7 +255,7 @@ contract MultiSigWallet is ReentrancyGuard {
     }
 
     // ============================================================
-    // GETTER FUNCTION
+    // GETTER FUNCTIONS
     // ============================================================
 
     function getTransactionCount() external view returns (uint256) {
@@ -254,5 +281,10 @@ contract MultiSigWallet is ReentrancyGuard {
 
     function getBalance() external view returns (uint256) {
         return address(this).balance;
+    }
+
+    // Returns the EIP-712 domain separator — useful for client-side signing
+    function domainSeparator() external view returns (bytes32) {
+        return _domainSeparatorV4();
     }
 }
